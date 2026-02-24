@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gerenciador de Máquinas Virtuais Linux</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        h1 {
+            color: #333;
+            font-size: 24px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+        }
+
+        .btn-danger {
+            background: #f56565;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #e53e3e;
+        }
+
+        .machines-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .machine-card {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            cursor: pointer;
+            transition: all 0.3s;
+            position: relative;
+        }
+
+        .machine-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .machine-card.active {
+            border: 3px solid #667eea;
+        }
+
+        .machine-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .machine-name {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .machine-status {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 12px;
+            color: #666;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #48bb78;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .machine-info {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 10px;
+        }
+
+        .machine-actions {
+            display: flex;
+            gap: 5px;
+        }
+
+        .btn-small {
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+
+        .terminal-container {
+            display: none;
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+        }
+
+        .terminal-container.active {
+            display: block;
+        }
+
+        .terminal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+
+        .terminal-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        #screen_container {
+            background: #000;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            max-width: 500px;
+            width: 90%;
+        }
+
+        .modal-header {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #333;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: 500;
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+
+        .stats {
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            display: flex;
+            gap: 20px;
+            justify-content: space-around;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #667eea;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+
+        .network-indicator {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #48bb78;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+            color: white;
+            font-size: 16px;
+        }
+
+        .loading.active {
+            display: block;
+        }
+
+        .spinner {
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top: 3px solid white;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🖥️ Gerenciador de Máquinas Virtuais Linux</h1>
+            <div class="controls">
+                <button class="btn btn-primary" onclick="showCreateModal()">
+                    ➕ Nova Máquina
+                </button>
+            </div>
+        </header>
+
+        <div class="stats">
+            <div class="stat-item">
+                <div class="stat-value" id="totalMachines">0</div>
+                <div class="stat-label">Máquinas Totais</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="runningMachines">0</div>
+                <div class="stat-label">Em Execução</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="networkConnections">0</div>
+                <div class="stat-label">Conexões de Rede</div>
+            </div>
+        </div>
+
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <div>Carregando biblioteca v86...</div>
+        </div>
+
+        <div class="terminal-container" id="terminalContainer">
+            <div class="terminal-header">
+                <div class="terminal-title" id="terminalTitle">Terminal</div>
+                <button class="btn btn-danger btn-small" onclick="closeTerminal()">
+                    ✕ Fechar
+                </button>
+            </div>
+            <div id="screen_container"></div>
+        </div>
+
+        <div class="machines-grid" id="machinesGrid"></div>
+    </div>
+
+    <!-- Modal para criar nova máquina -->
+    <div class="modal" id="createModal">
+        <div class="modal-content">
+            <div class="modal-header">Criar Nova Máquina Virtual</div>
+            <div class="form-group">
+                <label for="machineName">Nome da Máquina:</label>
+                <input type="text" id="machineName" placeholder="Ex: Ubuntu-Server-01">
+            </div>
+            <div class="form-group">
+                <label for="machineMemory">Memória RAM (MB):</label>
+                <select id="machineMemory">
+                    <option value="64">64 MB</option>
+                    <option value="128" selected>128 MB</option>
+                    <option value="256">256 MB</option>
+                    <option value="512">512 MB</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="machineImage">Imagem do Sistema:</label>
+                <select id="machineImage">
+                    <option value="buildroot">Buildroot Linux (Recomendado)</option>
+                    <option value="alpine">Alpine Linux</option>
+                </select>
+            </div>
+            <div class="modal-actions">
+                <button class="btn" onclick="hideCreateModal()">Cancelar</button>
+                <button class="btn btn-primary" onclick="createMachine()">Criar</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://copy.sh/v86/libv86.js"></script>
+    <script>
+        // Gerenciador de máquinas virtuais
+        class VMManager {
+            constructor() {
+                this.machines = [];
+                this.activeMachine = null;
+                this.networkBus = null;
+                this.machineCounter = 0;
+                this.v86Loaded = false;
+            }
+
+            initialize() {
+                // Cria o bus de rede apenas quando V86 estiver disponível
+                if (typeof V86 !== 'undefined') {
+                    this.networkBus = V86.prototype.create_network_bus();
+                    this.v86Loaded = true;
+                    this.initializeUI();
+                }
+            }
+
+            initializeUI() {
+                this.updateStats();
+                document.getElementById('loading').classList.remove('active');
+            }
+
+            createMachine(name, memory, imageType) {
+                if (!this.v86Loaded || !this.networkBus) {
+                    alert('Aguarde o carregamento da biblioteca v86...');
+                    return null;
+                }
+
+                const machineId = `vm-${++this.machineCounter}`;
+                
+                // Configuração da imagem baseada no tipo
+                let imageConfig;
+                if (imageType === 'buildroot') {
+                    imageConfig = {
+                        bzimage: {
+                            url: "https://copy.sh/v86/images/buildroot-bzimage.bin",
+                        },
+                        initrd: {
+                            url: "https://copy.sh/v86/images/buildroot-initrd.bin",
+                        }
+                    };
+                } else {
+                    imageConfig = {
+                        cdrom: {
+                            url: "https://copy.sh/v86/images/alpine-standard-3.17.0-x86.iso",
+                        }
+                    };
+                }
+
+                const emulator = new V86({
+                    wasm_path: "https://copy.sh/v86/v86.wasm",
+                    memory_size: memory * 1024 * 1024,
+                    vga_memory_size: 2 * 1024 * 1024,
+                    autostart: false,
+                    network_relay_url: "wss://relay.widgetry.org/",
+                    network_adapter: this.networkBus,
+                    ...imageConfig,
+                });
+
+                const machine = {
+                    id: machineId,
+                    name: name,
+                    emulator: emulator,
+                    memory: memory,
+                    imageType: imageType,
+                    status: 'stopped',
+                    createdAt: new Date()
+                };
+
+                this.machines.push(machine);
+                this.renderMachines();
+                this.updateStats();
+
+                return machine;
+            }
+
+            startMachine(machineId) {
+                const machine = this.machines.find(m => m.id === machineId);
+                if (machine && machine.status === 'stopped') {
+                    machine.emulator.run();
+                    machine.status = 'running';
+                    this.renderMachines();
+                    this.updateStats();
+                }
+            }
+
+            stopMachine(machineId) {
+                const machine = this.machines.find(m => m.id === machineId);
+                if (machine && machine.status === 'running') {
+                    machine.emulator.stop();
+                    machine.status = 'stopped';
+                    this.renderMachines();
+                    this.updateStats();
+                }
+            }
+
+            deleteMachine(machineId) {
+                const index = this.machines.findIndex(m => m.id === machineId);
+                if (index !== -1) {
+                    const machine = this.machines[index];
+                    if (machine.status === 'running') {
+                        machine.emulator.stop();
+                    }
+                    machine.emulator.destroy();
+                    this.machines.splice(index, 1);
+                    
+                    if (this.activeMachine?.id === machineId) {
+                        this.closeTerminal();
+                    }
+                    
+                    this.renderMachines();
+                    this.updateStats();
+                }
+            }
+
+            openTerminal(machineId) {
+                const machine = this.machines.find(m => m.id === machineId);
+                if (!machine) return;
+
+                // Inicia a máquina se não estiver rodando
+                if (machine.status === 'stopped') {
+                    this.startMachine(machineId);
+                }
+
+                // Remove o terminal atual se houver
+                const container = document.getElementById('screen_container');
+                container.innerHTML = '';
+
+                // Adiciona o terminal da máquina selecionada
+                machine.emulator.screen_container = container;
+                
+                this.activeMachine = machine;
+                document.getElementById('terminalTitle').textContent = `Terminal - ${machine.name}`;
+                document.getElementById('terminalContainer').classList.add('active');
+
+                // Atualiza a interface
+                this.renderMachines();
+            }
+
+            closeTerminal() {
+                if (this.activeMachine) {
+                    this.activeMachine.emulator.screen_container = null;
+                    this.activeMachine = null;
+                }
+                document.getElementById('terminalContainer').classList.remove('active');
+                this.renderMachines();
+            }
+
+            renderMachines() {
+                const grid = document.getElementById('machinesGrid');
+                grid.innerHTML = '';
+
+                this.machines.forEach(machine => {
+                    const card = document.createElement('div');
+                    card.className = 'machine-card';
+                    if (this.activeMachine?.id === machine.id) {
+                        card.className += ' active';
+                    }
+
+                    const statusColor = machine.status === 'running' ? '#48bb78' : '#a0aec0';
+
+                    card.innerHTML = `
+                        <div class="network-indicator" style="background: ${statusColor}"></div>
+                        <div class="machine-header">
+                            <div class="machine-name">${machine.name}</div>
+                            <div class="machine-status">
+                                <div class="status-dot" style="background: ${statusColor}; animation: ${machine.status === 'running' ? 'pulse 2s infinite' : 'none'}"></div>
+                                ${machine.status === 'running' ? 'Rodando' : 'Parada'}
+                            </div>
+                        </div>
+                        <div class="machine-info">
+                            <div>💾 RAM: ${machine.memory} MB</div>
+                            <div>🐧 ${machine.imageType === 'buildroot' ? 'Buildroot Linux' : 'Alpine Linux'}</div>
+                            <div>📅 ${machine.createdAt.toLocaleString('pt-BR')}</div>
+                        </div>
+                        <div class="machine-actions">
+                            ${machine.status === 'stopped' ? 
+                                `<button class="btn btn-primary btn-small" onclick="vmManager.startMachine('${machine.id}')">▶️ Iniciar</button>` :
+                                `<button class="btn btn-danger btn-small" onclick="vmManager.stopMachine('${machine.id}')">⏹️ Parar</button>`
+                            }
+                            <button class="btn btn-primary btn-small" onclick="vmManager.openTerminal('${machine.id}')">🖥️ Terminal</button>
+                            <button class="btn btn-danger btn-small" onclick="vmManager.deleteMachine('${machine.id}')">🗑️</button>
+                        </div>
+                    `;
+
+                    grid.appendChild(card);
+                });
+            }
+
+            updateStats() {
+                document.getElementById('totalMachines').textContent = this.machines.length;
+                document.getElementById('runningMachines').textContent = 
+                    this.machines.filter(m => m.status === 'running').length;
+                document.getElementById('networkConnections').textContent = 
+                    this.machines.filter(m => m.status === 'running').length;
+            }
+        }
+
+        // Instância global do gerenciador
+        let vmManager;
+
+        // Aguarda o carregamento completo da biblioteca v86
+        window.addEventListener('load', () => {
+            // Mostra loading
+            document.getElementById('loading').classList.add('active');
+            
+            // Aguarda a biblioteca v86 estar disponível
+            const checkV86 = setInterval(() => {
+                if (typeof V86 !== 'undefined') {
+                    clearInterval(checkV86);
+                    vmManager = new VMManager();
+                    vmManager.initialize();
+                }
+            }, 100);
+            
+            // Timeout de segurança (10 segundos)
+            setTimeout(() => {
+                clearInterval(checkV86);
+                if (!vmManager) {
+                    document.getElementById('loading').innerHTML = `
+                        <div class="spinner"></div>
+                        <div>Erro ao carregar biblioteca v86. Por favor, recarregue a página.</div>
+                    `;
+                }
+            }, 10000);
+        });
+
+        // Funções do modal
+        function showCreateModal() {
+            document.getElementById('createModal').classList.add('active');
+        }
+
+        function hideCreateModal() {
+            document.getElementById('createModal').classList.remove('active');
+        }
+
+        function createMachine() {
+            const name = document.getElementById('machineName').value || `VM-${vmManager.machineCounter + 1}`;
+            const memory = parseInt(document.getElementById('machineMemory').value);
+            const imageType = document.getElementById('machineImage').value;
+
+            vmManager.createMachine(name, memory, imageType);
+            hideCreateModal();
+
+            // Limpa o formulário
+            document.getElementById('machineName').value = '';
+        }
+
+        function closeTerminal() {
+            vmManager.closeTerminal();
+        }
+
+        // Fechar modal ao clicar fora
+        document.getElementById('createModal').addEventListener('click', (e) => {
+            if (e.target.id === 'createModal') {
+                hideCreateModal();
+            }
+        });
+
+        // Atalhos de teclado
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                if (document.getElementById('createModal').classList.contains('active')) {
+                    hideCreateModal();
+                } else if (vmManager.activeMachine) {
+                    closeTerminal();
+                }
+            }
+        });
+    </script>
+</body>
+</html>
