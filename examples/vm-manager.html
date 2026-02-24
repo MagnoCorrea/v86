@@ -382,22 +382,22 @@
         </div>
     </div>
 
-    <script src="https://copy.sh/v86/libv86.js"></script>
+    <script src="../build/libv86.js"></script>
     <script>
         // Gerenciador de máquinas virtuais
         class VMManager {
             constructor() {
                 this.machines = [];
                 this.activeMachine = null;
-                this.networkBus = null;
+                // networkBus is no longer used; networking is handled by
+                // forwarding events between emulator instances.
                 this.machineCounter = 0;
                 this.v86Loaded = false;
             }
 
             initialize() {
-                // Cria o bus de rede apenas quando V86 estiver disponível
+                // when the v86 library is available we mark ourselves ready
                 if (typeof V86 !== 'undefined') {
-                    this.networkBus = V86.prototype.create_network_bus();
                     this.v86Loaded = true;
                     this.initializeUI();
                 }
@@ -409,7 +409,7 @@
             }
 
             createMachine(name, memory, imageType) {
-                if (!this.v86Loaded || !this.networkBus) {
+                if (!this.v86Loaded) {
                     alert('Aguarde o carregamento da biblioteca v86...');
                     return null;
                 }
@@ -420,29 +420,42 @@
                 let imageConfig;
                 if (imageType === 'buildroot') {
                     imageConfig = {
-                        bzimage: {
-                            url: "https://copy.sh/v86/images/buildroot-bzimage.bin",
-                        },
+                        bzimage: {  
+                            url: "../images/buildroot-bzimage.bin",
+                        },  
                         initrd: {
-                            url: "https://copy.sh/v86/images/buildroot-initrd.bin",
+                            //url: "../images/buildroot-initrd.bin",
+                            url: "../images/buildroot-bzimage   .bin",
                         }
                     };
                 } else {
                     imageConfig = {
                         cdrom: {
-                            url: "https://copy.sh/v86/images/alpine-standard-3.17.0-x86.iso",
+                            url: "../images/alpine-standard-3.17.0-x86.iso",
                         }
                     };
                 }
 
                 const emulator = new V86({
-                    wasm_path: "https://copy.sh/v86/v86.wasm",
+                    wasm_path: "../build/v86.wasm",
                     memory_size: memory * 1024 * 1024,
                     vga_memory_size: 2 * 1024 * 1024,
                     autostart: false,
+                    // use the widgetry relayed network for internet access, but we
+                    // also forward traffic between vms below
                     network_relay_url: "wss://relay.widgetry.org/",
-                    network_adapter: this.networkBus,
                     ...imageConfig,
+                });
+
+                // simple LAN: forward net0-send from this emulator to every
+                // other machine as net0-receive. This emulates a shared
+                // Ethernet segment without relying on internal v86 helpers.
+                emulator.add_listener("net0-send", data => {
+                    for (const m of this.machines) {
+                        if (m.id !== machineId) {
+                            m.emulator.bus.send("net0-receive", data);
+                        }
+                    }
                 });
 
                 const machine = {

@@ -1,0 +1,1433 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NetLab — Rede de VMs Reais (v86/copy.sh)</title>
+
+<!--
+  v86 by copy.sh — x86 PC emulator in WebAssembly
+  https://copy.sh/v86/
+
+  Mecanismo de rede (inspirado em two_instances.html):
+    Cada VM emite pacotes via: emulator.add_listener("net0-send", fn)
+    Recebe pacotes via:        emulator.bus.send("net0-receive", data)
+
+  O VirtualSwitch JS intercepta net0-send de cada VM, inspeciona
+  o frame Ethernet (dst MAC), e encaminha para os vizinhos corretos
+  conforme a topologia desenhada — sem backend obrigatório.
+
+  Backend Java/Spring Boot é opcional: sincroniza topologia e
+  registra eventos via WebSocket, mas a rede entre VMs funciona
+  100% no browser via o switch JS.
+-->
+<script src="../build/libv86.js"></script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;800&display=swap');
+
+:root {
+  --bg:      #050a0f;
+  --panel:   #080f18;
+  --panel2:  #0a1520;
+  --border:  #142030;
+  --border2: #1a3a5a;
+  --accent:  #00d4ff;
+  --accent2: #ff6b00;
+  --accent3: #00ff88;
+  --accent4: #a855f7;
+  --text:    #c8e8ff;
+  --dim:     #3a6a8a;
+  --c-srv:   #ff6b00;
+  --c-rtr:   #00d4ff;
+  --c-pc:    #00ff88;
+  --c-sw:    #a855f7;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background:var(--bg); color:var(--text);
+  font-family:'Exo 2',sans-serif; height:100vh;
+  display:flex; flex-direction:column; overflow:hidden;
+}
+
+/* ── HEADER ── */
+header {
+  height:50px; background:var(--panel); border-bottom:1px solid var(--border2);
+  display:flex; align-items:center; padding:0 14px; gap:10px;
+  flex-shrink:0; z-index:100;
+}
+.logo {
+  font-family:'Share Tech Mono',monospace; font-size:17px;
+  color:var(--accent); letter-spacing:3px; text-shadow:0 0 10px var(--accent);
+}
+.logo span { color:var(--accent2); }
+.logo sub  { font-size:9px; color:var(--dim); letter-spacing:1px; vertical-align:bottom; }
+.vsep { width:1px; height:26px; background:var(--border2); flex-shrink:0; }
+.hspace { flex:1; }
+
+.btn {
+  padding:5px 12px; border:1px solid var(--border2); background:transparent; color:var(--text);
+  font-family:'Exo 2',sans-serif; font-size:11px; font-weight:600; letter-spacing:.8px;
+  cursor:pointer; border-radius:3px; transition:all .15s; text-transform:uppercase; white-space:nowrap;
+}
+.btn:hover  { border-color:var(--accent); color:var(--accent); box-shadow:0 0 8px rgba(0,212,255,.2); }
+.btn.primary { background:var(--accent); color:#000; border-color:var(--accent); }
+.btn.primary:hover { background:#00f0ff; box-shadow:0 0 16px var(--accent); }
+.btn.warn   { border-color:var(--accent2); color:var(--accent2); }
+.btn.warn:hover   { background:var(--accent2); color:#000; }
+.btn.success{ border-color:var(--accent3); color:var(--accent3); }
+.btn.success:hover{ background:var(--accent3); color:#000; }
+.btn.purple { border-color:var(--accent4); color:var(--accent4); }
+.btn.purple:hover { background:var(--accent4); color:#fff; }
+.btn.danger { border-color:#ff3355; color:#ff3355; }
+.btn.danger:hover { background:#ff3355; color:#fff; }
+
+.ws-indicator {
+  display:flex; align-items:center; gap:6px; font-size:10px;
+  font-family:'Share Tech Mono',monospace; color:var(--dim); padding:4px 10px;
+  border:1px solid var(--border2); border-radius:3px; background:rgba(0,0,0,.3);
+}
+.ws-dot { width:7px; height:7px; border-radius:50%; background:#555; transition:background .3s; }
+.ws-dot.connected { background:var(--accent3); box-shadow:0 0 6px var(--accent3); animation:blink 2s infinite; }
+.ws-dot.error     { background:#ff3355; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+.stat-bar { display:flex; gap:14px; align-items:center; }
+.stat { font-family:'Share Tech Mono',monospace; font-size:10px; color:var(--dim); }
+.stat b { color:var(--accent); }
+
+/* ── LAYOUT ── */
+.workspace { display:flex; flex:1; overflow:hidden; }
+
+/* ── SIDEBAR ── */
+.sidebar {
+  width:202px; background:var(--panel); border-right:1px solid var(--border2);
+  display:flex; flex-direction:column; flex-shrink:0; overflow-y:auto;
+}
+.sb-section { padding:10px; border-bottom:1px solid var(--border); }
+.sb-label {
+  font-size:9px; letter-spacing:2px; color:var(--dim);
+  text-transform:uppercase; margin-bottom:8px; font-family:'Share Tech Mono',monospace;
+}
+.palette { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+.pal-item {
+  display:flex; flex-direction:column; align-items:center; gap:5px; padding:8px 4px;
+  border:1px solid var(--border); border-radius:4px; cursor:grab; transition:all .15s;
+  font-size:9px; letter-spacing:.5px; color:var(--dim); user-select:none;
+}
+.pal-item:hover { border-color:var(--accent); color:var(--text); background:rgba(0,212,255,.04); }
+.pal-icon { font-size:22px; line-height:1; }
+.tool-list { display:flex; flex-direction:column; gap:5px; }
+.tool-btn {
+  padding:7px 8px; border:1px solid var(--border); background:transparent; color:var(--dim);
+  font-family:'Exo 2',sans-serif; font-size:10px; font-weight:600; cursor:pointer;
+  border-radius:3px; transition:all .15s; text-align:left; letter-spacing:.5px;
+  display:flex; align-items:center; gap:7px;
+}
+.tool-btn:hover  { border-color:var(--accent); color:var(--accent); }
+.tool-btn.active { border-color:var(--accent); color:var(--accent); background:rgba(0,212,255,.07); }
+
+/* ── CANVAS ── */
+.canvas-area {
+  flex:1; position:relative; overflow:hidden;
+  background:
+    radial-gradient(ellipse at 25% 20%, rgba(0,50,100,.12) 0%, transparent 55%),
+    radial-gradient(ellipse at 75% 80%, rgba(255,107,0,.05) 0%, transparent 45%),
+    var(--bg);
+}
+#canvas-bg, #main-canvas { position:absolute; top:0; left:0; width:100%; height:100%; }
+#canvas-bg  { pointer-events:none; }
+#main-canvas { z-index:1; }
+#nodes-layer {
+  position:absolute; top:0; left:0; width:100%; height:100%;
+  z-index:2; pointer-events:none;
+}
+.canvas-label {
+  position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+  font-size:10px; color:var(--dim); font-family:'Share Tech Mono',monospace;
+  letter-spacing:1px; pointer-events:none; white-space:nowrap;
+}
+
+/* ── NODES ── */
+.net-node {
+  position:absolute; width:80px; display:flex; flex-direction:column;
+  align-items:center; gap:4px; cursor:pointer; user-select:none;
+  transform:translate(-50%,-50%); z-index:10; pointer-events:all;
+}
+.node-body {
+  width:52px; height:52px; border-radius:8px; display:flex;
+  align-items:center; justify-content:center; font-size:22px;
+  transition:all .2s; position:relative;
+}
+.node-body.server { background:linear-gradient(135deg,#2d1200,#6a2e00); border:2px solid var(--c-srv); box-shadow:0 0 10px rgba(255,107,0,.25); }
+.node-body.router { background:linear-gradient(135deg,#001228,#002850); border:2px solid var(--c-rtr); box-shadow:0 0 10px rgba(0,212,255,.25); }
+.node-body.pc     { background:linear-gradient(135deg,#001a09,#003a15); border:2px solid var(--c-pc);  box-shadow:0 0 10px rgba(0,255,136,.18); }
+.node-body.switch { background:linear-gradient(135deg,#0f0022,#1e0044); border:2px solid var(--c-sw);  box-shadow:0 0 10px rgba(168,85,247,.25); }
+.net-node:hover .node-body { filter:brightness(1.3); }
+.net-node.selected .node-body { box-shadow:0 0 0 2px #fff,0 0 18px rgba(255,255,255,.22) !important; }
+.net-node.src-node .node-body { box-shadow:0 0 0 2px var(--accent2),0 0 16px rgba(255,107,0,.5) !important; }
+
+/* VM status ring on the node */
+.vm-ring {
+  position:absolute; inset:-4px; border-radius:12px;
+  border:2px solid transparent; transition:all .4s;
+  pointer-events:none;
+}
+.vm-ring.booting { border-color:var(--accent2); box-shadow:0 0 8px var(--accent2); animation:spin 1.5s linear infinite; }
+.vm-ring.ready   { border-color:var(--accent3); box-shadow:0 0 10px var(--accent3); }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* LED dot top-right of node */
+.vm-led {
+  position:absolute; top:-3px; right:-3px; width:10px; height:10px;
+  border-radius:50%; background:#333; border:2px solid var(--bg); transition:all .3s;
+}
+.vm-led.booting { background:var(--accent2); box-shadow:0 0 5px var(--accent2); animation:blink 0.8s infinite; }
+.vm-led.ready   { background:var(--accent3); box-shadow:0 0 6px var(--accent3); }
+
+.node-label { font-size:9px; text-align:center; color:var(--text); max-width:80px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.node-ip    { font-size:8px; color:var(--dim); font-family:'Share Tech Mono',monospace; }
+
+/* ── INFO PANEL ── */
+.info-panel {
+  width:252px; background:var(--panel); border-left:1px solid var(--border2);
+  display:flex; flex-direction:column; flex-shrink:0;
+}
+.ip-header { padding:12px 14px; border-bottom:1px solid var(--border2); font-size:10px; letter-spacing:2px; color:var(--dim); text-transform:uppercase; font-family:'Share Tech Mono',monospace; }
+.ip-body   { flex:1; padding:12px 14px; display:flex; flex-direction:column; gap:10px; overflow-y:auto; }
+.ip-empty  { color:var(--dim); font-size:11px; text-align:center; margin-top:32px; line-height:1.9; }
+.ifield { display:flex; flex-direction:column; gap:3px; }
+.ifield label { font-size:9px; color:var(--dim); letter-spacing:1px; text-transform:uppercase; font-family:'Share Tech Mono',monospace; }
+.ifield input, .ifield select, .ifield textarea {
+  background:rgba(0,0,0,.4); border:1px solid var(--border2); color:var(--text);
+  font-family:'Share Tech Mono',monospace; font-size:11px; padding:5px 7px;
+  border-radius:3px; outline:none; width:100%; transition:border-color .15s;
+}
+.ifield input:focus, .ifield select:focus { border-color:var(--accent); }
+.ifield select option { background:#0a1520; }
+.iactions { display:flex; flex-direction:column; gap:6px; }
+.vm-btn {
+  padding:8px; background:rgba(0,0,0,.4); border:1px solid var(--accent3); color:var(--accent3);
+  font-family:'Exo 2',sans-serif; font-size:10px; font-weight:700; letter-spacing:.8px;
+  cursor:pointer; border-radius:3px; transition:all .2s; text-transform:uppercase;
+  display:flex; align-items:center; justify-content:center; gap:6px;
+}
+.vm-btn:hover { background:rgba(0,255,136,.1); box-shadow:0 0 10px rgba(0,255,136,.2); }
+.vm-btn.blue  { border-color:var(--accent);  color:var(--accent); }
+.vm-btn.blue:hover  { background:rgba(0,212,255,.1); }
+.vm-btn.orange{ border-color:var(--accent2); color:var(--accent2); }
+.vm-btn.orange:hover{ background:rgba(255,107,0,.1); }
+.node-stats {
+  font-size:9px; color:var(--dim); font-family:'Share Tech Mono',monospace;
+  line-height:2; background:rgba(0,0,0,.3); padding:8px; border-radius:3px; border:1px solid var(--border);
+}
+
+/* ── LOG ── */
+.log-panel {
+  height:130px; background:#020609; border-top:1px solid var(--border2);
+  display:flex; flex-direction:column; flex-shrink:0;
+}
+.log-hdr {
+  height:24px; background:var(--panel); border-bottom:1px solid var(--border);
+  padding:0 10px; display:flex; align-items:center; gap:8px; flex-shrink:0;
+}
+.log-dot { width:6px; height:6px; border-radius:50%; background:var(--accent3); animation:blink 1.5s infinite; }
+.log-label { font-family:'Share Tech Mono',monospace; font-size:9px; color:var(--dim); letter-spacing:2px; text-transform:uppercase; }
+.log-body  { flex:1; overflow-y:auto; padding:4px 10px; font-family:'Share Tech Mono',monospace; font-size:10px; color:var(--dim); line-height:1.8; }
+.le { display:flex; gap:8px; }
+.lt { color:#1a4a6a; white-space:nowrap; }
+.lm.info    { color:var(--dim); }
+.lm.success { color:var(--accent3); }
+.lm.warn    { color:var(--accent2); }
+.lm.error   { color:#ff3355; }
+.lm.net     { color:var(--accent); }
+.lm.pkt     { color:var(--accent4); }
+
+/* ── VM MODAL (terminal v86) ── */
+.overlay {
+  position:fixed; inset:0; background:rgba(0,0,0,.78); z-index:1000;
+  display:flex; align-items:center; justify-content:center;
+  backdrop-filter:blur(5px); opacity:0; pointer-events:none; transition:opacity .2s;
+}
+.overlay.open { opacity:1; pointer-events:all; }
+.vm-modal {
+  background:#000; border:1px solid var(--border2); border-radius:6px;
+  display:flex; flex-direction:column; resize:both; overflow:auto;
+  width:860px; height:560px; min-width:600px; min-height:400px;
+  box-shadow:0 0 60px rgba(0,212,255,.12), 0 40px 80px rgba(0,0,0,.9);
+}
+.vm-titlebar {
+  height:38px; background:var(--panel2); border-bottom:1px solid var(--border2);
+  display:flex; align-items:center; padding:0 12px; gap:8px; flex-shrink:0;
+  border-radius:6px 6px 0 0; cursor:move; user-select:none;
+}
+.tdot { width:11px; height:11px; border-radius:50%; cursor:pointer; flex-shrink:0; }
+.tdot.cl { background:#ff5f56; } .tdot.mi { background:#ffbd2e; } .tdot.mx { background:#27c93f; }
+.vm-title  { flex:1; text-align:center; font-family:'Share Tech Mono',monospace; font-size:11px; color:var(--dim); letter-spacing:1px; }
+.vm-status { font-size:10px; font-family:'Share Tech Mono',monospace; }
+.vm-status.booting { color:var(--accent2); }
+.vm-status.ready   { color:var(--accent3); }
+.vm-status.off     { color:var(--dim); }
+
+.vm-body { flex:1; overflow:hidden; display:flex; flex-direction:column; }
+
+/* v86 screen container — estilos idênticos ao copy.sh */
+.screen_container {
+  flex:1; background:#000; overflow:hidden;
+  display:flex; flex-direction:column; cursor:text;
+}
+.screen_container > div {
+  flex:1; white-space:pre; font:14px monospace; line-height:14px;
+  color:#c8ffc8; background:#000; overflow:hidden;
+  padding:6px 8px; outline:none;
+}
+.screen_container canvas { display:none; }
+
+.vm-loading {
+  flex:1; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:16px; background:#000;
+}
+.vm-spinner {
+  width:40px; height:40px; border:3px solid var(--border2);
+  border-top-color:var(--accent); border-radius:50%; animation:spin 0.9s linear infinite;
+}
+.vm-loading-msg { font-family:'Share Tech Mono',monospace; font-size:12px; color:var(--dim); letter-spacing:1px; text-align:center; line-height:1.8; }
+
+.vm-toolbar {
+  height:32px; background:var(--panel2); border-top:1px solid var(--border);
+  display:flex; align-items:center; padding:0 10px; gap:8px; flex-shrink:0;
+}
+.vm-net-chip {
+  font-family:'Share Tech Mono',monospace; font-size:10px; color:var(--accent3);
+  background:rgba(0,255,136,.08); border:1px solid rgba(0,255,136,.25);
+  padding:2px 8px; border-radius:3px;
+}
+.vm-sw-chip {
+  font-family:'Share Tech Mono',monospace; font-size:10px;
+  padding:2px 8px; border-radius:3px;
+}
+.vm-sw-chip.on  { color:var(--accent); background:rgba(0,212,255,.08); border:1px solid rgba(0,212,255,.25); }
+.vm-sw-chip.off { color:var(--dim);    background:rgba(0,0,0,.3);       border:1px solid var(--border); }
+
+/* ── CONTEXT MENU ── */
+.ctx {
+  position:fixed; background:var(--panel2); border:1px solid var(--border2);
+  border-radius:4px; padding:3px 0; z-index:500;
+  min-width:158px; box-shadow:0 8px 24px rgba(0,0,0,.7); display:none;
+}
+.ctx.open { display:block; }
+.ctx-i {
+  padding:7px 12px; font-size:11px; cursor:pointer; color:var(--text);
+  transition:background .1s; display:flex; align-items:center; gap:7px;
+}
+.ctx-i:hover { background:rgba(0,212,255,.07); color:var(--accent); }
+.ctx-i.danger:hover { background:rgba(255,51,85,.07); color:#ff3355; }
+.ctx-sep { height:1px; background:var(--border); margin:2px 0; }
+
+/* ── TOAST ── */
+.toast {
+  position:fixed; bottom:145px; left:50%; transform:translateX(-50%) translateY(10px);
+  background:var(--panel2); border:1px solid var(--accent); padding:8px 18px;
+  border-radius:4px; font-size:11px; color:var(--accent); font-family:'Share Tech Mono',monospace;
+  letter-spacing:1px; opacity:0; transition:all .25s; pointer-events:none; z-index:2000;
+}
+.toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+
+::-webkit-scrollbar { width:5px; height:5px; }
+::-webkit-scrollbar-track { background:var(--bg); }
+::-webkit-scrollbar-thumb { background:var(--border2); border-radius:3px; }
+::-webkit-scrollbar-thumb:hover { background:var(--accent); }
+
+body.connect-mode #main-canvas { cursor:crosshair; }
+body.delete-mode  .net-node    { cursor:not-allowed; }
+</style>
+</head>
+<body>
+
+<!-- ── HEADER ── -->
+<header>
+  <div class="logo">NET<span>LAB</span><sub>v86</sub></div>
+  <div class="vsep"></div>
+
+  <div class="ws-indicator">
+    <div class="ws-dot" id="ws-dot"></div>
+    <span id="ws-label">Backend offline</span>
+  </div>
+  <input id="ws-url" type="text" value="ws://localhost:8080/ws/switch"
+    style="background:rgba(0,0,0,.4);border:1px solid var(--border2);color:var(--dim);
+           font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 8px;
+           border-radius:3px;outline:none;width:224px;">
+  <button class="btn primary" onclick="connectWS()">Conectar WS</button>
+
+  <div class="vsep"></div>
+  <button class="btn warn"    onclick="loadExample()">⚡ Exemplo</button>
+  <button class="btn"         onclick="clearAll()">🗑 Limpar</button>
+  <button class="btn purple"  onclick="syncTopology()">🔄 Sync</button>
+  <button class="btn success" onclick="bootAllVMs()">▶ Boot Todas VMs</button>
+  <button class="btn danger"  onclick="stopAllVMs()">■ Parar VMs</button>
+
+  <div class="hspace"></div>
+  <div class="stat-bar">
+    <div class="stat">Nós: <b id="s-nodes">0</b></div>
+    <div class="stat">Links: <b id="s-links">0</b></div>
+    <div class="stat">VMs: <b id="s-vms">0</b>/ready</div>
+    <div class="stat">Pkts: <b id="s-pkts">0</b></div>
+    <div class="stat" id="s-mode" style="color:var(--accent2)">SELECT</div>
+  </div>
+</header>
+
+<div class="workspace">
+
+  <!-- ── SIDEBAR ── -->
+  <div class="sidebar">
+    <div class="sb-section">
+      <div class="sb-label">Dispositivos</div>
+      <div class="palette">
+        <div class="pal-item" draggable="true" ondragstart="onDragStart(event,'server')" onclick="addNode('server')">
+          <div class="pal-icon">🖥️</div>Servidor
+        </div>
+        <div class="pal-item" draggable="true" ondragstart="onDragStart(event,'router')" onclick="addNode('router')">
+          <div class="pal-icon">🌐</div>Roteador
+        </div>
+        <div class="pal-item" draggable="true" ondragstart="onDragStart(event,'pc')" onclick="addNode('pc')">
+          <div class="pal-icon">💻</div>PC / Host
+        </div>
+        <div class="pal-item" draggable="true" ondragstart="onDragStart(event,'switch')" onclick="addNode('switch')">
+          <div class="pal-icon">🔀</div>Switch
+        </div>
+      </div>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Ferramentas</div>
+      <div class="tool-list">
+        <button class="tool-btn active" id="t-select"  onclick="setMode('select')">👆 Selecionar</button>
+        <button class="tool-btn"        id="t-connect" onclick="setMode('connect')">🔗 Conectar</button>
+        <button class="tool-btn"        id="t-delete"  onclick="setMode('delete')">❌ Remover</button>
+      </div>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Topologias</div>
+      <div class="tool-list">
+        <button class="tool-btn" onclick="loadExample('basic')">⚡ Rede Básica</button>
+        <button class="tool-btn" onclick="loadExample('mesh')">🕸 Mesh</button>
+        <button class="tool-btn" onclick="loadExample('star')">⭐ Estrela</button>
+        <button class="tool-btn" onclick="loadExample('chain')">🔗 Cadeia</button>
+      </div>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">v86 / copy.sh</div>
+      <div style="font-size:9px;color:var(--dim);line-height:2;font-family:'Share Tech Mono',monospace;">
+        VMs Linux reais no browser<br>
+        Switch JS roteia frames<br>
+        Ethernet entre vizinhos<br><br>
+        <b style="color:var(--accent)">Após boot:</b><br>
+        <span style="color:var(--accent3)">ifconfig eth0 up arp</span><br>
+        <span style="color:var(--accent3)">&lt;ip&gt;</span><br>
+        <span style="color:var(--accent3)">ping &lt;ip-destino&gt;</span><br><br>
+        <b style="color:var(--dim)">Duplo-clique</b> = abre VM
+      </div>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Switch Virtual</div>
+      <div id="switch-stats" style="font-size:9px;color:var(--dim);line-height:2;font-family:'Share Tech Mono',monospace;">
+        fwd: 0<br>drp: 0<br>bcast: 0
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CANVAS + LOG ── -->
+  <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+    <div class="canvas-area" id="canvas-area"
+         ondrop="onDrop(event)" ondragover="event.preventDefault()">
+      <canvas id="canvas-bg"></canvas>
+      <canvas id="main-canvas"></canvas>
+      <div id="nodes-layer"></div>
+      <div class="canvas-label">
+        Arraste dispositivos · Duplo-clique = abrir VM · Clique direito = opções · Modo: <b id="mode-label">SELECT</b>
+      </div>
+    </div>
+
+    <div class="log-panel">
+      <div class="log-hdr">
+        <div class="log-dot"></div>
+        <div class="log-label">Switch Virtual JS / Rede v86</div>
+        <div class="hspace"></div>
+        <button class="btn" style="font-size:9px;padding:2px 7px" onclick="clearLog()">Limpar</button>
+      </div>
+      <div class="log-body" id="log-body"></div>
+    </div>
+  </div>
+
+  <!-- ── INFO PANEL ── -->
+  <div class="info-panel">
+    <div class="ip-header">📋 Propriedades</div>
+    <div class="ip-body" id="info-body">
+      <div class="ip-empty">
+        Selecione um nó<br>para editar<br><br>
+        💻 Duplo-clique<br>para abrir VM<br><br>
+        🟢 = VM pronta<br>
+        🟠 = VM iniciando
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── CONTEXT MENU ── -->
+<div class="ctx" id="ctx-menu">
+  <div class="ctx-i" onclick="ctxBoot()">▶ Iniciar VM Linux</div>
+  <div class="ctx-i" onclick="ctxOpen()">🖥 Abrir Terminal</div>
+  <div class="ctx-i" onclick="ctxInjectNet()">🔧 Injetar Config Rede</div>
+  <div class="ctx-i" onclick="ctxConnect()">🔗 Conectar a...</div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-i" onclick="ctxToggle()">⚡ Ligar/Desligar</div>
+  <div class="ctx-i" onclick="ctxDupe()">📋 Duplicar</div>
+  <div class="ctx-i danger" onclick="ctxDelete()">🗑 Remover</div>
+</div>
+
+<!-- ── VM MODAL (terminal v86 real) ── -->
+<div class="overlay" id="overlay" onclick="closeOverlayBg(event)">
+  <div class="vm-modal" id="vm-modal">
+
+    <div class="vm-titlebar" id="vm-titlebar">
+      <div class="tdot cl" onclick="closeVM()"></div>
+      <div class="tdot mi"></div>
+      <div class="tdot mx"></div>
+      <div class="vm-title" id="vm-title">Terminal — VM</div>
+      <div class="vm-status off" id="vm-status-badge">desligada</div>
+    </div>
+
+    <div class="vm-body" id="vm-body">
+      <!-- conteúdo injetado dinamicamente (loading ou screen_container) -->
+      <div class="vm-loading" id="vm-loading">
+        <div class="vm-spinner"></div>
+        <div class="vm-loading-msg" id="vm-loading-msg">
+          Iniciando Alpine Linux...<br>
+          <span style="font-size:10px;color:#1a3a5a">copy.sh / v86 — Linux real no browser</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="vm-toolbar">
+      <div class="vm-net-chip" id="vm-net-chip">—</div>
+      <div class="vm-sw-chip off" id="vm-sw-chip">switch: offline</div>
+      <div class="hspace"></div>
+      <button class="btn" style="font-size:9px;padding:2px 8px" onclick="vmSendCAD()">Ctrl+Alt+Del</button>
+      <button class="btn primary" style="font-size:9px;padding:2px 8px" onclick="vmInjectNet()">🔧 Config Rede</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- Containers ocultos das VMs (fora do DOM visível) -->
+<div id="vm-containers" style="position:absolute;top:-9999px;left:-9999px;width:0;height:0;overflow:hidden;"></div>
+
+<script>
+"use strict";
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONFIG v86 (copy.sh CDN)
+// ════════════════════════════════════════════════════════════════════════════
+const V86_CDN = {
+  wasm_path:      "../build/v86.wasm",
+  bios:           { url: "../bios/seabios.bin"  },
+  vga_bios:       { url: "../bios/vgabios.bin"  },
+  cdrom:          { url: "../images/linux4.iso" },
+  memory_size:    128 * 1024 * 1024,
+  vga_memory_size: 2 * 1024 * 1024,
+  autostart: true,
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// ESTADO
+// ════════════════════════════════════════════════════════════════════════════
+const nodes       = {};     // nodeId → NodeInfo
+const links       = [];     // [{ id, from, to }]
+const emulators   = {};     // nodeId → V86 instance
+const vmStatus    = {};     // nodeId → 'off'|'booting'|'ready'
+let selectedNode  = null;
+let connectSrc    = null;
+let activeVMNode  = null;
+let mode          = 'select';
+let dragType      = null;
+let nc            = 0;
+let ctxNodeId     = null;
+let animLinks     = [];
+let hlLinks       = [];
+let ws            = null;
+let wsConnected   = false;
+
+// Estatísticas do switch virtual
+const SW = { forwarded:0, dropped:0, broadcast:0, bytes:0 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// VIRTUAL SWITCH JS
+//
+// Implementa um switch Ethernet L2 para N VMs.
+// Baseado em two_instances.html (copy.sh/v86):
+//   emulator.add_listener("net0-send", data => ...)  → captura frame saindo da VM
+//   emulator.bus.send("net0-receive", data)           → injeta frame na VM
+//
+// Extensão para N VMs:
+//   1. Cada VM é registrada no switch ao ser criada
+//   2. Em net0-send, o switch lê o dst MAC do frame Ethernet
+//   3. Se dst MAC é broadcast (ff:ff:ff:ff:ff:ff), encaminha para TODOS os vizinhos
+//   4. Caso contrário, tenta entregar pelo MAC table (unicast)
+//   5. Se MAC desconhecido, faz flooding para vizinhos (comportamento de switch L2)
+//   6. Aprende src MAC → nodeId (MAC learning)
+//   7. Respeita a topologia: só encaminha para nós DIRETAMENTE conectados
+// ════════════════════════════════════════════════════════════════════════════
+const macTable = new Map(); // srcMac → nodeId (MAC learning)
+
+function vsAttach(nodeId) {
+  const em = emulators[nodeId];
+  if (!em) return;
+
+  em.add_listener("net0-send", (data) => {
+    vsForward(nodeId, data);
+  });
+
+  log(`[Switch] VM ${nodes[nodeId]?.label || nodeId} conectada à rede virtual`, 'success');
+}
+
+function vsForward(srcNodeId, data) {
+  const frame = parseEthFrame(data);
+  if (!frame) { SW.dropped++; updateSWStats(); return; }
+
+  // MAC learning: aprende onde está o remetente
+  macTable.set(frame.srcMac, srcNodeId);
+
+  const neighbors = getNeighbors(srcNodeId);
+  if (neighbors.length === 0) { SW.dropped++; updateSWStats(); return; }
+
+  const isBroadcast = frame.dstMac === 'ff:ff:ff:ff:ff:ff';
+  let targets = [];
+
+  if (isBroadcast) {
+    // Broadcast: todos os vizinhos ativos com VM ready
+    targets = neighbors.filter(id => vmStatus[id] === 'ready');
+    SW.broadcast++;
+  } else {
+    // Unicast: verifica MAC table primeiro
+    const knownDest = macTable.get(frame.dstMac);
+    if (knownDest && neighbors.includes(knownDest) && vmStatus[knownDest] === 'ready') {
+      targets = [knownDest]; // entrega direta
+    } else {
+      // Flooding para vizinhos (MAC desconhecido ou fora do segmento direto)
+      targets = neighbors.filter(id => vmStatus[id] === 'ready');
+    }
+  }
+
+  if (targets.length === 0) { SW.dropped++; updateSWStats(); return; }
+
+  // Encaminha o frame para cada destino
+  targets.forEach(dstNodeId => {
+    emulators[dstNodeId].bus.send("net0-receive", data);
+  });
+
+  SW.forwarded++;
+  SW.bytes += data.byteLength || 0;
+  updateSWStats();
+
+  // Animação visual do pacote
+  animatePacketForward(srcNodeId, targets);
+
+  // Atualiza contador no header
+  document.getElementById('s-pkts').textContent = SW.forwarded;
+
+  // Log (throttled: 1 em cada 10 pacotes para não lotar)
+  if (SW.forwarded % 10 === 1) {
+    const srcLabel = nodes[srcNodeId]?.label || srcNodeId;
+    const dstLabels = targets.map(id => nodes[id]?.label || id).join(',');
+    log(`[pkt] ${frame.proto} ${srcLabel}→${dstLabels} ${data.byteLength}B ${isBroadcast ? '(bcast)' : ''}`, 'pkt');
+  }
+
+  // Notifica backend (se conectado)
+  if (wsConnected) {
+    wsSend({ type: 'PACKET_EVENT', nodeId: srcNodeId,
+             srcMac: frame.srcMac, dstMac: frame.dstMac,
+             proto: frame.proto, size: data.byteLength,
+             broadcast: isBroadcast });
+  }
+}
+
+// Parse dos primeiros 14 bytes do frame Ethernet
+function parseEthFrame(data) {
+  try {
+    const b = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (b.length < 14) return null;
+    const hex = arr => Array.from(arr).map(x => x.toString(16).padStart(2,'0')).join(':');
+    const dstMac = hex(b.slice(0, 6));
+    const srcMac = hex(b.slice(6, 12));
+    const etype  = (b[12] << 8 | b[13]);
+    const proto  = etype === 0x0800 ? 'IPv4'
+                 : etype === 0x0806 ? 'ARP'
+                 : etype === 0x86DD ? 'IPv6'
+                 : '0x' + etype.toString(16).toUpperCase();
+    return { dstMac, srcMac, etype, proto };
+  } catch (_) { return null; }
+}
+
+// Vizinhos diretos de um nó que estão online na topologia
+function getNeighbors(nodeId) {
+  return links
+    .filter(l => (l.from === nodeId || l.to === nodeId))
+    .map(l => l.from === nodeId ? l.to : l.from)
+    .filter(id => nodes[id] && nodes[id].online);
+}
+
+function updateSWStats() {
+  document.getElementById('switch-stats').innerHTML =
+    `fwd: <b style="color:var(--accent3)">${SW.forwarded}</b><br>` +
+    `drp: <b style="color:var(--accent2)">${SW.dropped}</b><br>`   +
+    `bcast: <b style="color:var(--accent4)">${SW.broadcast}</b>`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GERENCIAMENTO DE VMs
+// ════════════════════════════════════════════════════════════════════════════
+
+function bootVM(nodeId) {
+  const node = nodes[nodeId];
+  if (!node) return;
+
+  // Se já existe, só abre o modal
+  if (emulators[nodeId]) { openVM(nodeId); return; }
+
+  vmStatus[nodeId] = 'booting';
+  updateNodeEl(node);
+  log(`[v86] Iniciando VM ${node.label}... (Alpine Linux via copy.sh)`, 'warn');
+
+  // Container DOM oculto para esta VM (idêntico à estrutura do copy.sh)
+  const containerId = `vm-c-${nodeId}`;
+  let container = document.getElementById(containerId);
+  if (!container) {
+    container = document.createElement('div');
+    container.id = containerId;
+    container.className = 'screen_container';
+    // Estrutura exigida pelo v86: div (texto) + canvas (gráfico)
+    container.innerHTML =
+      '<div style="white-space:pre;font:14px monospace;line-height:14px;color:#c8ffc8;background:#000;padding:6px 8px;width:800px;height:550px;overflow:hidden;"></div>' +
+      '<canvas style="display:none"></canvas>';
+    document.getElementById('vm-containers').appendChild(container);
+  }
+
+  const em = new V86({
+    ...V86_CDN,
+    screen_container: container,
+  });
+
+  emulators[nodeId] = em;
+
+  // Detecta boot completo via saída serial
+  // O Alpine Linux mostra "localhost login:" quando está pronto
+  let bootBuf = '';
+  em.add_listener('serial0-output-char', (ch) => {
+    bootBuf += ch;
+    if (bootBuf.length > 2000) bootBuf = bootBuf.slice(-1000);
+
+    const isReady = bootBuf.includes('localhost login:') ||
+                    bootBuf.includes('/ #') ||
+                    bootBuf.includes('~ #');
+
+    if (isReady && vmStatus[nodeId] !== 'ready') {
+      vmStatus[nodeId] = 'ready';
+      updateNodeEl(node);
+      vsAttach(nodeId);  // ← registra no switch virtual
+      updateVMCount();
+      log(`[v86] VM ${node.label} pronta! Boot completo.`, 'success');
+      if (node.ip) {
+        setTimeout(() => autoInjectNet(nodeId), 1500);
+      }
+      // Atualiza modal se estiver aberto para este nó
+      if (activeVMNode === nodeId) {
+        showVMReady(nodeId);
+      }
+    }
+  });
+
+  openVM(nodeId);
+}
+
+// Injeta comandos de rede via serial (mesmo mecanismo do two_instances.html)
+function autoInjectNet(nodeId) {
+  const node = nodes[nodeId];
+  if (!node || !node.ip || vmStatus[nodeId] !== 'ready') return;
+  const em = emulators[nodeId];
+  if (!em) return;
+
+  const hostname = node.label.toLowerCase().replace(/[^a-z0-9]/g, '-');
+  const cmds = [
+    '\n',
+    `ifconfig eth0 up arp ${node.ip}\n`,
+    `ifconfig lo 127.0.0.1 up\n`,
+    `hostname ${hostname}\n`,
+    `echo "NetLab: ${node.label} online @ ${node.ip}"\n`,
+  ];
+  if (node.gateway && node.gateway !== node.ip) {
+    cmds.splice(3, 0, `route add default gw ${node.gateway}\n`);
+  }
+
+  let delay = 300;
+  cmds.forEach(cmd => {
+    setTimeout(() => { if (emulators[nodeId]) em.serial0_send(cmd); }, delay);
+    delay += 400;
+  });
+
+  log(`[net] Config injetada em ${node.label}: ${node.ip}`, 'success');
+}
+
+// Abre o modal da VM
+function openVM(nodeId) {
+  const node = nodes[nodeId];
+  if (!node) return;
+  activeVMNode = nodeId;
+  const state = vmStatus[nodeId] || 'off';
+
+  // Titlebar
+  document.getElementById('vm-title').textContent =
+    `Terminal — ${node.label}  (${node.ip || 'sem IP'})`;
+  const badge = document.getElementById('vm-status-badge');
+  badge.textContent = { off:'desligada', booting:'iniciando...', ready:'pronta ✅' }[state] || state;
+  badge.className = `vm-status ${state}`;
+
+  // Toolbar
+  document.getElementById('vm-net-chip').textContent =
+    node.ip ? `${node.ip} / ${node.subnet || '255.255.255.0'}` : 'sem IP';
+  const swChip = document.getElementById('vm-sw-chip');
+  swChip.textContent = vmStatus[nodeId] === 'ready' ? 'switch: online' : 'switch: offline';
+  swChip.className   = `vm-sw-chip ${vmStatus[nodeId] === 'ready' ? 'on' : 'off'}`;
+
+  // Body
+  const body = document.getElementById('vm-body');
+  if (state === 'ready') {
+    showVMReady(nodeId);
+  } else if (state === 'booting') {
+    body.innerHTML = '';
+    const loading = makeLoadingEl('Iniciando Alpine Linux...<br><span style="font-size:10px;color:#1a3a5a">Aguarde o boot completar</span>');
+    body.appendChild(loading);
+    body.appendChild(makeToolbar(node));
+    // Quando pronto, atualiza automaticamente via bootBuf listener
+  } else {
+    // off — mostra botão de iniciar
+    body.innerHTML = '';
+    const off = document.createElement('div');
+    off.className = 'vm-loading';
+    off.innerHTML = `
+      <div style="font-size:40px">💤</div>
+      <div class="vm-loading-msg">VM não iniciada</div>
+      <button class="btn success" style="margin-top:8px" onclick="bootVM('${nodeId}')">▶ Iniciar VM Linux</button>
+    `;
+    body.appendChild(off);
+    body.appendChild(makeToolbar(node));
+  }
+
+  document.getElementById('overlay').classList.add('open');
+
+  // Foco no teclado na VM ativa
+  if (emulators[nodeId] && state === 'ready') {
+    emulators[nodeId].keyboard_set_status(true);
+  }
+}
+
+function showVMReady(nodeId) {
+  if (activeVMNode !== nodeId) return;
+  const node   = nodes[nodeId];
+  const em     = emulators[nodeId];
+  const body   = document.getElementById('vm-body');
+  const contId = `vm-c-${nodeId}`;
+  const cont   = document.getElementById(contId);
+
+  body.innerHTML = '';
+
+  if (cont) {
+    // Move o screen_container para dentro do modal
+    cont.style.cssText = 'flex:1;display:flex;flex-direction:column;';
+    body.appendChild(cont);
+  } else {
+    const ph = document.createElement('div');
+    ph.className = 'vm-loading';
+    ph.innerHTML = '<div class="vm-loading-msg">Erro: container não encontrado</div>';
+    body.appendChild(ph);
+  }
+
+  body.appendChild(makeToolbar(node));
+
+  // Atualiza status badge
+  const badge = document.getElementById('vm-status-badge');
+  badge.textContent = 'pronta ✅';
+  badge.className = 'vm-status ready';
+
+  // Atualiza chip do switch
+  const swChip = document.getElementById('vm-sw-chip');
+  swChip.textContent = 'switch: online';
+  swChip.className = 'vm-sw-chip on';
+
+  if (em) em.keyboard_set_status(true);
+}
+
+function makeLoadingEl(msg) {
+  const d = document.createElement('div');
+  d.className = 'vm-loading';
+  d.innerHTML = `<div class="vm-spinner"></div><div class="vm-loading-msg">${msg}</div>`;
+  return d;
+}
+
+function makeToolbar(node) {
+  const tb = document.createElement('div');
+  tb.className = 'vm-toolbar';
+  tb.id = 'vm-toolbar-dyn';
+  tb.innerHTML = `
+    <div class="vm-net-chip">${node.ip || '—'} / ${node.subnet || '255.255.255.0'}</div>
+    <div class="vm-sw-chip ${vmStatus[node.id]==='ready'?'on':'off'}">
+      switch: ${vmStatus[node.id]==='ready'?'online':'offline'}
+    </div>
+    <div class="hspace"></div>
+    <button class="btn" style="font-size:9px;padding:2px 8px" onclick="vmSendCAD()">Ctrl+Alt+Del</button>
+    <button class="btn primary" style="font-size:9px;padding:2px 8px" onclick="vmInjectNet()">🔧 Config Rede</button>
+  `;
+  return tb;
+}
+
+function closeVM() {
+  if (activeVMNode) {
+    const em = emulators[activeVMNode];
+    if (em) em.keyboard_set_status(false);
+
+    // Devolve o container para o div oculto ao fechar o modal
+    const contId = `vm-c-${activeVMNode}`;
+    const cont   = document.getElementById(contId);
+    if (cont) {
+      cont.style.cssText = '';
+      document.getElementById('vm-containers').appendChild(cont);
+    }
+  }
+  document.getElementById('overlay').classList.remove('open');
+  activeVMNode = null;
+}
+
+function closeOverlayBg(e) {
+  if (e.target === document.getElementById('overlay')) closeVM();
+}
+
+function vmSendCAD() {
+  const em = emulators[activeVMNode];
+  if (!em) return;
+  em.keyboard_send_scancodes([0x1D, 0x38, 0x53, 0xD3, 0xB8, 0x9D]);
+}
+
+function vmInjectNet() {
+  if (activeVMNode) autoInjectNet(activeVMNode);
+  showToast('Comandos de rede enviados!');
+}
+
+function bootAllVMs() {
+  const ids = Object.keys(nodes).filter(id => !emulators[id] && nodes[id].online);
+  ids.forEach((id, i) => setTimeout(() => bootVM(id), i * 2000));
+  log(`[v86] Iniciando ${ids.length} VM(s)...`, 'warn');
+  showToast(`Iniciando ${ids.length} VM(s)...`);
+}
+
+function stopAllVMs() {
+  Object.keys(emulators).forEach(id => {
+    try { emulators[id].destroy(); } catch (_) {}
+    delete emulators[id];
+    const c = document.getElementById(`vm-c-${id}`);
+    if (c) c.remove();
+  });
+  Object.keys(vmStatus).forEach(id => { vmStatus[id] = 'off'; });
+  Object.values(nodes).forEach(n => updateNodeEl(n));
+  macTable.clear();
+  updateVMCount();
+  closeVM();
+  log('[v86] Todas as VMs paradas.', 'warn');
+  showToast('VMs paradas.');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CANVAS
+// ════════════════════════════════════════════════════════════════════════════
+const area = document.getElementById('canvas-area');
+const bgC  = document.getElementById('canvas-bg');
+const mc   = document.getElementById('main-canvas');
+const bgX  = bgC.getContext('2d');
+const ctx  = mc.getContext('2d');
+
+function resize() {
+  bgC.width = mc.width = area.clientWidth;
+  bgC.height = mc.height = area.clientHeight;
+  drawGrid(); drawLinks();
+}
+window.addEventListener('resize', resize);
+setTimeout(resize, 80);
+
+function drawGrid() {
+  bgX.clearRect(0, 0, bgC.width, bgC.height);
+  const step = 28;
+  bgX.strokeStyle = '#0c1820'; bgX.lineWidth = 1;
+  for (let x = 0; x < bgC.width; x += step) { bgX.beginPath(); bgX.moveTo(x,0); bgX.lineTo(x,bgC.height); bgX.stroke(); }
+  for (let y = 0; y < bgC.height; y += step) { bgX.beginPath(); bgX.moveTo(0,y); bgX.lineTo(bgC.width,y); bgX.stroke(); }
+  bgX.fillStyle = '#1a3040';
+  for (let x = 0; x < bgC.width; x += step)
+    for (let y = 0; y < bgC.height; y += step) { bgX.beginPath(); bgX.arc(x,y,1,0,Math.PI*2); bgX.fill(); }
+}
+
+function drawLinks() {
+  ctx.clearRect(0, 0, mc.width, mc.height);
+
+  links.forEach(lk => {
+    const a = nodes[lk.from], b = nodes[lk.to];
+    if (!a || !b) return;
+    const hl      = hlLinks.includes(lk.id);
+    const bothRdy = vmStatus[a.id] === 'ready' && vmStatus[b.id] === 'ready';
+    ctx.save();
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    if (hl) {
+      ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 3;
+      ctx.shadowBlur = 14; ctx.shadowColor = '#00ff88';
+    } else if (bothRdy) {
+      ctx.strokeStyle = 'rgba(0,212,255,.6)'; ctx.lineWidth = 2.5;
+      ctx.shadowBlur = 6; ctx.shadowColor = '#00d4ff44';
+    } else if (a.online && b.online) {
+      ctx.strokeStyle = '#1a4060'; ctx.lineWidth = 2; ctx.shadowBlur = 0;
+    } else {
+      ctx.strokeStyle = '#0d1a24'; ctx.lineWidth = 2; ctx.shadowBlur = 0;
+    }
+    ctx.stroke(); ctx.restore();
+  });
+
+  // Pacotes animados
+  animLinks.forEach(al => {
+    const lk = links.find(l => l.id === al.linkId); if (!lk) return;
+    const a = nodes[lk.from], b = nodes[lk.to]; if (!a || !b) return;
+    const px = a.x + (b.x - a.x) * al.p, py = a.y + (b.y - a.y) * al.p;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#00ff88'; ctx.shadowBlur = 16; ctx.shadowColor = '#00ff88'; ctx.fill();
+    ctx.restore();
+  });
+}
+
+function animatePacketForward(srcId, dstIds) {
+  dstIds.forEach(dstId => {
+    const lk = links.find(l =>
+      (l.from === srcId && l.to === dstId) || (l.from === dstId && l.to === srcId));
+    if (!lk) return;
+    let p = 0;
+    const run = () => {
+      p = Math.min(p + 0.06, 1);
+      animLinks = animLinks.filter(a => a.linkId !== lk.id);
+      animLinks.push({ linkId: lk.id, p });
+      drawLinks();
+      if (p < 1) requestAnimationFrame(run);
+      else animLinks = animLinks.filter(a => a.linkId !== lk.id);
+    };
+    run();
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NÓS
+// ════════════════════════════════════════════════════════════════════════════
+const ICONS = { server:'🖥️', router:'🌐', pc:'💻', switch:'🔀' };
+const DEFAULTS = {
+  server: { label:'Servidor', role:'DHCP/GW',  ip:'192.168.1.1',   subnet:'255.255.255.0', gateway:'192.168.1.1' },
+  router: { label:'Roteador', role:'Router',   ip:'192.168.1.254', subnet:'255.255.255.0', gateway:'192.168.1.1' },
+  pc:     { label:'PC',       role:'Host',     ip:'',              subnet:'255.255.255.0', gateway:'192.168.1.1' },
+  switch: { label:'Switch',   role:'Switch',   ip:'',              subnet:'255.255.255.0', gateway:'' },
+};
+
+function rndMac() {
+  return Array.from({length:6}, () => Math.floor(Math.random()*256).toString(16).padStart(2,'0')).join(':');
+}
+
+function createNode(type, x, y, ov = {}) {
+  nc++;
+  const id = 'n' + nc, d = DEFAULTS[type];
+  const node = {
+    id, type, x, y,
+    label:   ov.label   ?? (d.label + ' ' + nc),
+    role:    ov.role    ?? d.role,
+    ip:      ov.ip      !== undefined ? ov.ip      : d.ip,
+    subnet:  ov.subnet  ?? d.subnet,
+    gateway: ov.gateway ?? d.gateway,
+    mac:     ov.mac     ?? rndMac(),
+    online:  ov.online  !== undefined ? ov.online  : true,
+    notes:   ov.notes   ?? '',
+  };
+  nodes[id] = node;
+  vmStatus[id] = 'off';
+  renderNode(node);
+  updateStats();
+  log(`Nó criado: ${node.label} (${type}) ${node.ip || ''}`, 'success');
+  return node;
+}
+
+function updateNodeEl(node) {
+  const el = document.getElementById('el-' + node.id); if (!el) return;
+  const state = vmStatus[node.id] || 'off';
+  // Atualiza o ring e led sem recriar o elemento inteiro
+  const ring = el.querySelector('.vm-ring');
+  const led  = el.querySelector('.vm-led');
+  const ipEl = el.querySelector('.node-ip');
+  if (ring) ring.className = `vm-ring${state === 'booting' ? ' booting' : state === 'ready' ? ' ready' : ''}`;
+  if (led)  led.className  = `vm-led${state === 'booting' ? ' booting' : state === 'ready' ? ' ready' : ''}`;
+  if (ipEl) ipEl.textContent = node.ip || '';
+  drawLinks();
+}
+
+function renderNode(node) {
+  const layer = document.getElementById('nodes-layer');
+  let el = document.getElementById('el-' + node.id);
+  if (!el) { el = document.createElement('div'); el.id = 'el-' + node.id; layer.appendChild(el); }
+
+  const state = vmStatus[node.id] || 'off';
+  el.className = 'net-node' +
+    (node.id === selectedNode ? ' selected'  : '') +
+    (node.id === connectSrc   ? ' src-node' : '');
+  el.style.cssText = `left:${node.x}px;top:${node.y}px`;
+  el.innerHTML = `
+    <div class="node-body ${node.type}">
+      <span>${ICONS[node.type]}</span>
+      <div class="vm-ring${state==='booting'?' booting':state==='ready'?' ready':''}"></div>
+      <div class="vm-led${state==='booting'?' booting':state==='ready'?' ready':''}"
+           title="VM: ${state==='ready'?'pronta':state==='booting'?'iniciando':'desligada'}"></div>
+    </div>
+    <div class="node-label">${node.label}</div>
+    ${node.ip ? `<div class="node-ip">${node.ip}</div>` : ''}
+  `;
+
+  // Evento de clique
+  el.onclick = e => { e.stopPropagation(); nodeClick(node.id); };
+
+  // Duplo-clique abre VM
+  el.ondblclick = e => { e.stopPropagation(); bootVM(node.id); };
+
+  // Clique direito
+  el.oncontextmenu = e => { e.preventDefault(); showCtx(e, node.id); };
+
+  // Drag para mover
+  let dragging = false, ox, oy;
+  el.onmousedown = e => {
+    if (mode !== 'select') return;
+    e.stopPropagation();
+    dragging = true; ox = e.clientX - node.x; oy = e.clientY - node.y;
+    const mv = ev => { if (!dragging) return; node.x = ev.clientX - ox; node.y = ev.clientY - oy; el.style.cssText = `left:${node.x}px;top:${node.y}px`; drawLinks(); };
+    const up = () => { dragging = false; document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); };
+    document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
+  };
+}
+
+function nodeClick(id) {
+  hideCtx();
+  if (mode === 'delete') { deleteNode(id); return; }
+  if (mode === 'connect') {
+    if (!connectSrc) {
+      connectSrc = id; renderNode(nodes[id]); log('Clique no nó destino para completar a conexão', 'warn');
+    } else if (connectSrc !== id) {
+      createLink(connectSrc, id);
+      const prevSrc = connectSrc;
+      connectSrc = null;
+      document.getElementById('el-' + prevSrc)?.classList.remove('src-node');
+    }
+    return;
+  }
+  select(id);
+}
+
+function select(id) {
+  if (selectedNode) document.getElementById('el-' + selectedNode)?.classList.remove('selected');
+  selectedNode = id;
+  if (id) { document.getElementById('el-' + id)?.classList.add('selected'); showInfo(id); }
+}
+
+function deleteNode(id) {
+  const n = nodes[id]; if (!n) return;
+  if (emulators[id]) { try { emulators[id].destroy(); } catch (_) {} delete emulators[id]; }
+  const c = document.getElementById(`vm-c-${id}`); if (c) c.remove();
+  delete vmStatus[id];
+  links.splice(0, links.length, ...links.filter(l => l.from !== id && l.to !== id));
+  delete nodes[id];
+  document.getElementById('el-' + id)?.remove();
+  if (selectedNode === id) { selectedNode = null; clearInfo(); }
+  drawLinks(); updateStats();
+  log(`Nó removido: ${n.label}`, 'warn');
+}
+
+function createLink(a, b) {
+  if (links.find(l => (l.from===a&&l.to===b)||(l.from===b&&l.to===a))) { showToast('Link já existe!'); return; }
+  const lk = { id: 'l' + Date.now(), from: a, to: b };
+  links.push(lk);
+  drawLinks(); updateStats();
+  log(`Link: ${nodes[a].label} ↔ ${nodes[b].label}`, 'net');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// INFO PANEL
+// ════════════════════════════════════════════════════════════════════════════
+function showInfo(id) {
+  const n = nodes[id]; if (!n) return;
+  const state = vmStatus[id] || 'off';
+  const conns = links.filter(l => l.from===id || l.to===id).length;
+  const stateColor = state==='ready' ? 'var(--accent3)' : state==='booting' ? 'var(--accent2)' : 'var(--dim)';
+  const stateText  = state==='ready' ? '🟢 Pronta' : state==='booting' ? '🟠 Iniciando...' : '⚫ Desligada';
+
+  document.getElementById('info-body').innerHTML = `
+    <div class="ifield"><label>Nome</label>
+      <input type="text" value="${n.label}" onchange="upd('${id}','label',this.value)"></div>
+    <div class="ifield"><label>Tipo</label>
+      <select onchange="upd('${id}','type',this.value)">
+        <option value="server" ${n.type==='server'?'selected':''}>🖥️ Servidor</option>
+        <option value="router" ${n.type==='router'?'selected':''}>🌐 Roteador</option>
+        <option value="pc"     ${n.type==='pc'    ?'selected':''}>💻 PC/Host</option>
+        <option value="switch" ${n.type==='switch'?'selected':''}>🔀 Switch</option>
+      </select></div>
+    <div class="ifield"><label>IP Address</label>
+      <input type="text" value="${n.ip}" placeholder="192.168.1.x"
+             onchange="upd('${id}','ip',this.value)"></div>
+    <div class="ifield"><label>Subnet Mask</label>
+      <input type="text" value="${n.subnet}" onchange="upd('${id}','subnet',this.value)"></div>
+    <div class="ifield"><label>Gateway</label>
+      <input type="text" value="${n.gateway}" onchange="upd('${id}','gateway',this.value)"></div>
+    <div class="ifield"><label>MAC Address</label>
+      <input type="text" value="${n.mac}" onchange="upd('${id}','mac',this.value)"></div>
+    <div class="iactions">
+      <button class="vm-btn orange" onclick="bootVM('${id}')">
+        ${state==='off'?'▶ Iniciar VM Linux':state==='booting'?'⏳ Aguarde o boot...':'🖥 Abrir Terminal'}
+      </button>
+      <button class="vm-btn blue" onclick="autoInjectNet('${id}')">🔧 Injetar Config Rede</button>
+      <button class="vm-btn" onclick="setMode('connect');nodeClick('${id}')">🔗 Conectar a...</button>
+      <button class="btn danger" onclick="deleteNode('${id}')" style="font-size:10px;padding:5px">🗑 Remover</button>
+    </div>
+    <div class="node-stats">
+      VM: <span style="color:${stateColor}">${stateText}</span><br>
+      Conexões: ${conns}<br>
+      Switch: ${state==='ready'?'<span style="color:var(--accent3)">conectada</span>':'offline'}<br>
+      ID: ${id}<br>
+      Duplo-clique = abre terminal
+    </div>
+  `;
+}
+
+function upd(id, k, v) {
+  nodes[id][k] = v;
+  renderNode(nodes[id]);
+  if (selectedNode === id) showInfo(id);
+  drawLinks();
+}
+
+function clearInfo() {
+  document.getElementById('info-body').innerHTML =
+    '<div class="ip-empty">Selecione um nó<br>para editar<br><br>💻 Duplo-clique<br>para abrir VM</div>';
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MODOS / DRAG / DROP
+// ════════════════════════════════════════════════════════════════════════════
+function setMode(m) {
+  mode = m;
+  ['select','connect','delete'].forEach(t => document.getElementById('t-'+t)?.classList.remove('active'));
+  document.getElementById('t-'+m)?.classList.add('active');
+  document.getElementById('s-mode').textContent = m.toUpperCase();
+  document.getElementById('mode-label').textContent = m.toUpperCase();
+  document.body.className = m + '-mode';
+  if (connectSrc) { document.getElementById('el-'+connectSrc)?.classList.remove('src-node'); connectSrc = null; }
+}
+
+function onDragStart(e, type) { dragType = type; e.dataTransfer.setData('text/plain', type); }
+function onDrop(e) {
+  e.preventDefault();
+  const rect = area.getBoundingClientRect();
+  const type = e.dataTransfer.getData('text/plain') || dragType;
+  if (type) { createNode(type, e.clientX - rect.left, e.clientY - rect.top); drawLinks(); }
+  dragType = null;
+}
+function addNode(type) {
+  const r = area.getBoundingClientRect();
+  createNode(type, r.width/2 + (Math.random()-.5)*120, r.height/2 + (Math.random()-.5)*100);
+  drawLinks();
+}
+
+mc.addEventListener('click', () => {
+  if (mode === 'select') { if (selectedNode) document.getElementById('el-'+selectedNode)?.classList.remove('selected'); selectedNode = null; clearInfo(); }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONTEXT MENU
+// ════════════════════════════════════════════════════════════════════════════
+function showCtx(e, id) {
+  ctxNodeId = id; select(id);
+  const m = document.getElementById('ctx-menu');
+  m.style.cssText = `left:${e.clientX}px;top:${e.clientY}px`;
+  m.classList.add('open');
+}
+function hideCtx() { document.getElementById('ctx-menu').classList.remove('open'); }
+document.addEventListener('click', hideCtx);
+
+function ctxBoot()      { hideCtx(); bootVM(ctxNodeId); }
+function ctxOpen()      { hideCtx(); emulators[ctxNodeId] ? openVM(ctxNodeId) : bootVM(ctxNodeId); }
+function ctxInjectNet() { hideCtx(); autoInjectNet(ctxNodeId); }
+function ctxConnect()   { hideCtx(); setMode('connect'); nodeClick(ctxNodeId); }
+function ctxToggle()    {
+  hideCtx();
+  const n = nodes[ctxNodeId]; if (!n) return;
+  n.online = !n.online; renderNode(n); drawLinks();
+  log(`${n.label}: ${n.online ? 'ONLINE' : 'OFFLINE'}`, n.online ? 'success' : 'warn');
+}
+function ctxDupe() {
+  hideCtx();
+  const n = nodes[ctxNodeId]; if (!n) return;
+  createNode(n.type, n.x+90, n.y+45, { label: n.label+' 2', ip:'', gateway:n.gateway, subnet:n.subnet });
+  drawLinks();
+}
+function ctxDelete() { hideCtx(); deleteNode(ctxNodeId); }
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOPOLOGIAS
+// ════════════════════════════════════════════════════════════════════════════
+function clearAll() {
+  stopAllVMs();
+  Object.keys(nodes).forEach(id => { delete nodes[id]; document.getElementById('el-'+id)?.remove(); });
+  links.splice(0);
+  nc = 0; selectedNode = null; connectSrc = null;
+  drawLinks(); updateStats(); clearInfo();
+  macTable.clear();
+  Object.assign(SW, { forwarded:0, dropped:0, broadcast:0, bytes:0 });
+  updateSWStats();
+  log('Topologia limpa.', 'warn');
+}
+
+function loadExample(type = 'basic') {
+  clearAll();
+  const W = area.clientWidth || 900, H = area.clientHeight || 430;
+  const cx = W/2, cy = H/2;
+
+  if (type === 'basic') {
+    // Gateway + Roteador + 3 PCs — exemplo clássico
+    const gw = createNode('server', cx-310, cy, { label:'GW-DHCP',  ip:'192.168.1.1',   gateway:'192.168.1.1' });
+    const rt = createNode('router', cx-100, cy, { label:'Router-R1',ip:'192.168.1.254', gateway:'192.168.1.1' });
+    const p1 = createNode('pc', cx+150, cy-130, { label:'PC-01', ip:'192.168.1.10', gateway:'192.168.1.254' });
+    const p2 = createNode('pc', cx+150, cy,     { label:'PC-02', ip:'192.168.1.11', gateway:'192.168.1.254' });
+    const p3 = createNode('pc', cx+150, cy+130, { label:'PC-03', ip:'192.168.1.12', gateway:'192.168.1.254' });
+    setTimeout(() => {
+      createLink(gw.id, rt.id);
+      createLink(rt.id, p1.id); createLink(rt.id, p2.id); createLink(rt.id, p3.id);
+      drawLinks();
+    }, 60);
+    log('Rede básica carregada. Duplo-clique num nó para iniciar a VM!', 'success');
+    log('Após boot: ifconfig eth0 up arp <ip> && ping <ip-outro-pc>', 'info');
+
+  } else if (type === 'mesh') {
+    const positions = [[cx-160,cy-100],[cx+160,cy-100],[cx-160,cy+100],[cx+160,cy+100]];
+    const rs = positions.map((p,i) => createNode('router',p[0],p[1],{
+      label:`R${i+1}`, ip:`10.0.${i+1}.1`, gateway:'10.0.1.1' }));
+    setTimeout(() => {
+      for (let i=0;i<rs.length;i++) for (let j=i+1;j<rs.length;j++) createLink(rs[i].id, rs[j].id);
+      drawLinks();
+    }, 60);
+    log('Topologia mesh 4 roteadores carregada.', 'success');
+
+  } else if (type === 'star') {
+    const sw = createNode('switch', cx, cy, { label:'SW-Core', ip:'192.168.0.1' });
+    const hosts = [];
+    for (let i=0;i<5;i++) {
+      const a = (i/5)*Math.PI*2 - Math.PI/2;
+      hosts.push(createNode('pc', cx+Math.cos(a)*180, cy+Math.sin(a)*180, {
+        label:`Host-${i+1}`, ip:`192.168.0.${i+10}`, gateway:'192.168.0.1' }));
+    }
+    setTimeout(() => { hosts.forEach(h => createLink(sw.id, h.id)); drawLinks(); }, 60);
+    log('Topologia estrela carregada.', 'success');
+
+  } else if (type === 'chain') {
+    const ips = ['10.0.0.1','10.0.0.2','10.0.0.3','10.0.0.4'];
+    const chain = ips.map((ip,i) => createNode('pc', cx-210+i*145, cy, {
+      label:`Node-${i+1}`, ip, gateway:'10.0.0.1' }));
+    setTimeout(() => {
+      for (let i=0;i<chain.length-1;i++) createLink(chain[i].id, chain[i+1].id);
+      drawLinks();
+    }, 60);
+    log('Topologia cadeia carregada.', 'success');
+  }
+
+  showToast('Topologia carregada!');
+  if (wsConnected) setTimeout(syncTopology, 200);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// WEBSOCKET → SPRING BOOT (opcional)
+// ════════════════════════════════════════════════════════════════════════════
+function connectWS() {
+  const url = document.getElementById('ws-url').value.trim();
+  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+  try {
+    ws = new WebSocket(url);
+    ws.onopen  = () => { wsConnected=true; setWsDot('connected','Backend conectado'); log('WS conectado: '+url,'success'); syncTopology(); };
+    ws.onclose = () => { wsConnected=false; setWsDot('','Backend offline'); log('WS desconectado','warn'); };
+    ws.onerror = () => { setWsDot('error','Erro WS'); log('Erro WebSocket — backend offline (rede v86 funciona sem ele)','warn'); };
+    ws.onmessage = e => { try { handleWsMsg(JSON.parse(e.data)); } catch (_) {} };
+  } catch (e) { log('Erro ao conectar WS: '+e.message, 'error'); }
+}
+
+function setWsDot(cls, lbl) {
+  document.getElementById('ws-dot').className = 'ws-dot ' + cls;
+  document.getElementById('ws-label').textContent = lbl;
+}
+function wsSend(obj) { if (ws && wsConnected) ws.send(JSON.stringify(obj)); }
+
+function handleWsMsg(msg) {
+  if (msg.type === 'LOG') log('[Backend] '+msg.msg, msg.level||'info');
+}
+
+function syncTopology() {
+  if (!wsConnected) return;
+  const topo = {
+    nodes: {}, links: links.map(l => ({id:l.id,from:l.from,to:l.to}))
+  };
+  Object.entries(nodes).forEach(([id,n]) => {
+    topo.nodes[id] = {id,label:n.label,type:n.type,ip:n.ip,mac:n.mac,subnet:n.subnet,gateway:n.gateway,online:n.online};
+  });
+  wsSend({ type:'TOPOLOGY_UPDATE', topology:topo });
+  showToast('Sync OK!');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UTILS
+// ════════════════════════════════════════════════════════════════════════════
+function updateStats() {
+  document.getElementById('s-nodes').textContent = Object.keys(nodes).length;
+  document.getElementById('s-links').textContent = links.length;
+  updateVMCount();
+}
+function updateVMCount() {
+  document.getElementById('s-vms').textContent =
+    Object.values(vmStatus).filter(s => s==='ready').length;
+}
+
+function log(msg, cls='info') {
+  const body = document.getElementById('log-body');
+  const now  = new Date().toTimeString().slice(0,8);
+  const el   = document.createElement('div'); el.className = 'le';
+  el.innerHTML = `<span class="lt">[${now}]</span><span class="lm ${cls}">${msg}</span>`;
+  body.appendChild(el);
+  body.scrollTop = body.scrollHeight;
+}
+function clearLog() { document.getElementById('log-body').innerHTML = ''; }
+
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// ── INIT ──
+log('NetLab v86 iniciado. Carregue uma topologia e dê duplo-clique para iniciar VMs.', 'success');
+log('Switch virtual JS: intercepta net0-send e roteia frames Ethernet pela topologia.', 'info');
+</script>
+</body>
+</html>
